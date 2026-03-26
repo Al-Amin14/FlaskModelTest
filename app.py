@@ -2,6 +2,9 @@ from flask import Flask
 from routes.user_routes import user_bp
 from routes.aisug_routes import aisug
 from extensions import db
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app=Flask(__name__)
 app.config.from_object("config.Config")

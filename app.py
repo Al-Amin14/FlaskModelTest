@@ -16,5 +16,9 @@ with app.app_context():
     db.create_all()
 
 # Register routes
+@app.route('/')
+def hello():
+    return "Testing at opening"
+
 app.register_blueprint(user_bp,url_prefix="/api/users")
 app.register_blueprint(aisug,url_prefix="/api/ai")

@@ -6,38 +6,49 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from flask import Flask, request, jsonify
-import pyodbc
-
-from dotenv import load_dotenv
+# import pymssql
 import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+
 
 
 load_dotenv()
 
+
+
 def get_connection():
-    return pyodbc.connect(
-        'DRIVER={ODBC Driver 17 for SQL Server};'
-        f'SERVER={os.getenv("DB_SERVER")};'
-        f'DATABASE={os.getenv("DB_NAME")};'
-        f'UID={os.getenv("DB_USER")};'
-        f'PWD={os.getenv("DB_PASSWORD")};'
-        'Encrypt=Yes;'
-        'TrustServerCertificate=Yes;'
-        'MultipleActiveResultSets=True;'
+    server = os.getenv("DB_SERVER")
+    database = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+
+    engine = create_engine(
+        f"mssql+pymssql://{user}:{password}@{server}/{database}"
     )
+    return engine
 
 def get_data_from_db():
-    conn = get_connection()
-    query = """..."""
-    df = pd.read_sql(query, conn)
-    conn.close()
+    engine = get_connection()
+    query = """
+        SELECT 
+            e.Student_Id,
+            e.Course_Id,
+            c.Title,
+            c.Description,
+            c.Classes_id,
+            COUNT(e.Course_Id) OVER (PARTITION BY e.Course_Id) AS Course_Popularity
+        FROM Enroll AS e
+        JOIN Courses AS c ON e.Course_Id = c.Course_Id
+    """
+    df = pd.read_sql(query, engine)
     return df
 
+
 def get_all_courses_from_db():
-    conn = get_connection()
+    engine = get_connection()
     query = "SELECT Course_Id, Title, Description, Classes_id FROM Courses"
-    df = pd.read_sql(query, conn)
-    conn.close()
+    df = pd.read_sql(query, engine)
     return df
 
 
@@ -58,41 +69,27 @@ def get_course_suggestions(student_id, top_n=10):
             "model_accuracy": None
         }
 
-    # If student has no enrollment history
-    if student_id not in df['Student_Id'].values:
-        # Recommend top N most popular courses
-        popular = df.groupby(['Course_Id', 'Title', 'Description']) \
-                    .size() \
-                    .reset_index(name='Popularity') \
-                    .sort_values('Popularity', ascending=False)
-
-        # Filter out enrolled
-        popular = popular[~popular['Course_Id'].isin(enrolled_course_ids)]
-
+    # If student has no enrollment history OR not enough data for ML
+    if student_id not in df['Student_Id'].values or len(df) < 5:
         suggestions = []
-        for _, row in popular.head(top_n).iterrows():
+        for _, row in not_enrolled.head(top_n).iterrows():
             suggestions.append({
                 "course_id": int(row['Course_Id']),
                 "title": row['Title'],
                 "description": row['Description'],
-                "reason": "Most popular course among all students"
+                "confidence": None,
+                "reason": "Recommended course — explore and enroll!"
             })
 
         return {
             "student_id": student_id,
+            "total_suggestions": len(suggestions),
             "suggestions": suggestions,
-            "model_accuracy": None,
-            "reason": "No enrollment history found — showing most popular courses"
+            "overall_best_accuracy": None,
+            "reason": "Not enough data for ML — showing all available courses"
         }
 
     # -------- ML Part --------
-    # Build student-course matrix
-    pivot = df.pivot_table(
-        index='Student_Id',
-        columns='Course_Id',
-        values='Enrolled' if 'Enrolled' in df.columns else 'Course_Popularity',
-        fill_value=0
-    )
     df['Enrolled'] = 1
     pivot = df.pivot_table(
         index='Student_Id',
@@ -101,7 +98,6 @@ def get_course_suggestions(student_id, top_n=10):
         fill_value=0
     )
 
-    # Score each unenrolled course using ML
     suggestions = []
     best_score = 0
 
@@ -112,7 +108,6 @@ def get_course_suggestions(student_id, top_n=10):
         y = pivot[course_id]
         X = pivot.drop(columns=[course_id])
 
-        # Need at least 2 classes to train
         if y.nunique() < 2:
             continue
 
@@ -123,7 +118,6 @@ def get_course_suggestions(student_id, top_n=10):
             X_imputed, y, test_size=0.2, random_state=42
         )
 
-        # Train models and pick best
         models = {
             "Decision Tree": DecisionTreeClassifier(),
             "Naive Bayes": GaussianNB(),
@@ -149,7 +143,6 @@ def get_course_suggestions(student_id, top_n=10):
         if course_best_model is None:
             continue
 
-        # Predict if this student will enroll in this course
         if student_id in pivot.index:
             student_row = pivot.loc[student_id].drop(course_id).values.reshape(1, -1)
             student_row = imputer.transform(student_row)
@@ -172,18 +165,12 @@ def get_course_suggestions(student_id, top_n=10):
                 if course_best_score > best_score:
                     best_score = course_best_score
 
-    # Sort by confidence score
+    # Sort by confidence
     suggestions = sorted(suggestions, key=lambda x: x['confidence'], reverse=True)
 
-    # If ML found no suggestions fall back to popular courses
+    # Final fallback — always return something
     if not suggestions:
-        popular = df.groupby(['Course_Id', 'Title', 'Description']) \
-                    .size() \
-                    .reset_index(name='Popularity') \
-                    .sort_values('Popularity', ascending=False)
-        popular = popular[~popular['Course_Id'].isin(enrolled_course_ids)]
-
-        for _, row in popular.head(top_n).iterrows():
+        for _, row in not_enrolled.head(top_n).iterrows():
             suggestions.append({
                 "course_id": int(row['Course_Id']),
                 "title": row['Title'],
